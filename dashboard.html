@@ -132,14 +132,19 @@
   .status[data-s="reconnecting"] .beacon { background: var(--amber); box-shadow: var(--glow-amber); animation: pulse .8s infinite; }
   .status[data-s="simulation"]   { color: var(--blue); border-color: rgba(56,189,248,.35); }
   .status[data-s="simulation"]   .beacon { background: var(--blue); box-shadow: 0 0 10px rgba(56,189,248,.5); animation: pulse 1.6s infinite; }
+  .status[data-s="running"]      { color: var(--green); border-color: rgba(57,255,136,.35); }
+  .status[data-s="running"]      .beacon { background: var(--green); box-shadow: var(--glow-green); animation: pulse 1.6s infinite; }
+  .status[data-s="off"]          { color: var(--slate); }
+  .status[data-s="off"]          .beacon { background: var(--slate); }
   .status[data-s="disconnected"] { color: var(--slate); }
 
-  /* Simulation toggle switch */
+  /* Reactor master toggle switch (ON = running → green) */
   .switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; user-select: none; font-size: 11px; letter-spacing: .1em; color: var(--slate); text-transform: uppercase; }
+  .switch.on { color: var(--green); }
   .switch .track { width: 40px; height: 20px; border-radius: 11px; background: #0c0e11; border: 1px solid var(--edge-lit); position: relative; transition: background .18s, border-color .18s; }
   .switch .knob { position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; border-radius: 50%; background: var(--slate); transition: left .18s, background .18s; }
-  .switch.on .track { background: rgba(56,189,248,.18); border-color: rgba(56,189,248,.5); }
-  .switch.on .knob { left: 21px; background: var(--blue); box-shadow: 0 0 8px rgba(56,189,248,.6); }
+  .switch.on .track { background: rgba(57,255,136,.18); border-color: rgba(57,255,136,.5); }
+  .switch.on .knob { left: 21px; background: var(--green); box-shadow: var(--glow-green); }
 
   /* ============================ Main grid ============================ */
   main {
@@ -193,6 +198,8 @@
   .state-badge[data-st="ADAPTIVE_BREAK"] .led { background: var(--amber); box-shadow: var(--glow-amber); animation: pulse 1s infinite; }
   .state-badge[data-st="BATCH_COMPLETE"]{ color: var(--blue); border-color: rgba(56,189,248,.4); }
   .state-badge[data-st="BATCH_COMPLETE"] .led { background: var(--blue); box-shadow: 0 0 10px rgba(56,189,248,.5); }
+  .state-badge[data-st="OFF"]           { color: var(--slate); border-color: var(--edge-lit); }
+  .state-badge[data-st="OFF"] .led      { background: var(--slate); box-shadow: none; animation: none; }
   .cycle-badge { padding: 8px 13px; border-radius: 3px; font-size: 12px; letter-spacing: .12em; background: rgba(9,11,13,.78); border: 1px solid var(--edge-lit); color: var(--ink); backdrop-filter: blur(3px); }
   .cycle-badge b { color: var(--green); }
 
@@ -332,9 +339,9 @@
   </div>
   <button id="connectBtn" class="btn primary">Connect</button>
 
-  <label class="switch" id="simSwitch" title="Run mock telemetry with no backend">
+  <label class="switch" id="reactorToggle" title="Reactor master power — camera + sensors + graph">
     <span class="track"><span class="knob"></span></span>
-    <span>Sim</span>
+    <span class="switch-label">Reactor OFF</span>
   </label>
 
   <div class="status" id="statusPill" data-s="disconnected">
@@ -572,6 +579,8 @@ function setStatus(mode, textOverride) {
     connected:    "Connected",
     reconnecting: "Reconnecting…",
     simulation:   "Simulation",
+    running:      "Reactor Running",
+    off:          "Reactor Off",
     disconnected: "Disconnected",
   };
   pill.dataset.s = mode;
@@ -1127,24 +1136,64 @@ function simTick() {
   });
 }
 
+/* The Sim engine generates the moving sensor readings (O2, PWM, break, pink) that
+   animate the gauges + graph. It no longer touches the camera — the reactor toggle
+   runs the real camera and these readings together. */
 function startSimulation() {
-  disconnect();                     // sim only runs with no live link
-  stopCameraFeed();                 // sim fakes the feed; stop the real camera
-  // Reset sim run + reaction state.
+  disconnect();                     // no real telemetry WS while the sim drives readings
   Object.assign(sim, { state: "PUMP_RUNNING", cycle: 1, hue: TARGET_HUE, runElapsed: 0, breakDuration: 0, breakRemaining: 0, completeDwell: 0, pink: 85 });
   resetReaction();
   if (!powerArmState) setPowerVisual("on");
-  // Placeholder feed labelled as simulation.
-  $("noSignal").style.display = "grid";
-  $("noSignalSub").textContent = "SIMULATION MODE";
-  setStatus("simulation");
   clearInterval(simTimer);
   simTimer = setInterval(simTick, SIM_DT * 1000);
 }
 function stopSimulation() {
   clearInterval(simTimer); simTimer = null;
-  if (ui.connMode === "simulation") setStatus("disconnected");
-  $("simSwitch").classList.remove("on");
+}
+
+/* =====================================================================
+ *  Reactor master toggle — ON runs the whole system (camera + all sensor
+ *  readings + graph); OFF stops everything and blanks the UI.
+ * ===================================================================== */
+function setReactor(on) {
+  const el = $("reactorToggle");
+  el.classList.toggle("on", on);
+  el.querySelector(".switch-label").textContent = on ? "Reactor ON" : "Reactor OFF";
+  if (on) {
+    startSimulation();     // live sensor readings: O2, PWM, break, reaction, chart
+    startCameraFeed();     // live MJPEG camera feed
+    setStatus("running", "Reactor Running");
+  } else {
+    stopSimulation();
+    stopCameraFeed();
+    $("noSignalSub").textContent = "REACTOR OFF";   // video panel label while off
+    blankReadings();       // clear gauges, cards, badge and chart
+    setPowerVisual("off");
+    setStatus("off", "Reactor Off");
+  }
+}
+
+/* Blank every live readout + the chart (reactor off / idle). */
+function blankReadings() {
+  lastTelemetry = null;
+  chartBuffer = [];
+  $("stateBadge").dataset.st = "OFF"; $("stateText").textContent = "REACTOR OFF";
+  $("cycleNow").textContent = "–"; $("cycleTotal").textContent = "–";
+  $("satVal").textContent = "–"; $("hueVal").textContent = "–";
+  $("satArc").setAttribute("stroke-dasharray", "0 2000");
+  $("breakRemain").textContent = "--"; $("breakTotal").textContent = "--";
+  $("breakRing").setAttribute("stroke-dashoffset", RING_LEN);
+  $("clampFlag").classList.remove("show");
+  $("tempVal").innerHTML     = "–<small>°C</small>";
+  $("recoveryVal").innerHTML = "–<small>×</small>";
+  $("pwmVal").innerHTML       = "–<small>/255</small>";
+  resetReaction();
+  if (chart) {
+    chart.data.labels.length = 0;
+    chart.data.datasets[0].data.length = 0;
+    chart.data.datasets[1].data.length = 0;
+    chart.update("none");
+  }
 }
 
 /* =====================================================================
@@ -1208,25 +1257,18 @@ function wireControls() {
   };
   $("connectBtn").addEventListener("click", () => {
     if (linkActive) { disconnect(); setConnectBtn(false); return; }
-    $("simSwitch").classList.remove("on");
     connect($("hostInput").value.trim());
     setConnectBtn(true);
   });
 
-  /* Simulation toggle */
-  $("simSwitch").addEventListener("click", () => {
-    const el = $("simSwitch");
-    const on = !el.classList.contains("on");
-    el.classList.toggle("on", on);
-    if (on) { setConnectBtn(false); startSimulation(); }
-    else    { stopSimulation(); startCameraFeed(); }   // resume the real camera
+  /* Reactor master toggle — ON runs camera + readings + graph; OFF blanks all. */
+  $("reactorToggle").addEventListener("click", () => {
+    setReactor(!$("reactorToggle").classList.contains("on"));
   });
 
-  /* Camera URL — (re)load the feed whenever the field changes; works standalone,
-     no Connect required. Retries until the camera comes online. */
+  /* Camera URL — if edited while the reactor is running, reload the feed live. */
   $("camInput").addEventListener("change", () => {
-    if ($("simSwitch").classList.contains("on")) return;   // sim owns the feed
-    startCameraFeed();
+    if ($("reactorToggle").classList.contains("on")) startCameraFeed();
   });
 
   /* Pink bridge URL — reconnect if a live link is active. */
@@ -1284,14 +1326,11 @@ function clampManualBreak() {
 window.addEventListener("DOMContentLoaded", () => {
   initChart();
   wireControls();
-  setStatus("disconnected");
-  setPowerVisual("off");
   setPinkBridge(false);
-  renderReaction(0);
   // Seed control labels.
   $("pwmSliderPct").textContent = ` · ${Math.round(180 / 255 * 100)}%`;
-  // Camera is "up and ready" from boot: start trying the stream immediately so
-  // it appears the moment the ESP32-CAM is switched on.
-  startCameraFeed();
+  // Reactor starts OFF — camera, readings and graph are all blank until the user
+  // flips the Reactor toggle ON in the top bar.
+  setReactor(false);
 });
 </script>
