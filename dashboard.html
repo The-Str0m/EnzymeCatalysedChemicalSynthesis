@@ -1,0 +1,1297 @@
+<!--
+  ESP32-CAM Smart Bioreactor Dashboard
+  Single-file, zero-backend dashboard. Talks to ESP32 firmware over a WebSocket
+  and renders a live MJPEG feed + telemetry. Ships with a full Simulation Mode so
+  the UI is testable before firmware exists.
+
+  Only external dependency: Chart.js (CDN <script>). Everything else is inline.
+-->
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Bioreactor Control — ESP32-CAM</title>
+
+<!-- Chart.js (only permitted external dependency) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+  /* ============================ Design tokens ============================ */
+  :root {
+    --bg:        #0d0f12;   /* near-black charcoal base            */
+    --panel:     #15181c;   /* instrument bezel surface           */
+    --panel-2:   #1b1f24;   /* raised control surface             */
+    --edge:      #23282e;   /* hairline bezel border              */
+    --edge-lit:  #2f3742;   /* lit border                         */
+
+    --green:     #39ff88;   /* healthy / running                  */
+    --amber:     #ffb020;   /* warning / adaptive break           */
+    --red:       #ff4444;   /* kill switch / critical             */
+    --blue:      #38bdf8;   /* saturation trace                   */
+    --pink:      #ff5cc8;   /* reactor pink dye / reaction active  */
+    --slate:     #5a7a8a;   /* idle / secondary text              */
+
+    --ink:       #d7e0e6;   /* primary numeric ink                */
+    --ink-dim:   #8a97a0;   /* muted labels                       */
+
+    --mono: 'JetBrains Mono','IBM Plex Mono','SF Mono','SFMono-Regular',
+            'Menlo','Consolas','Roboto Mono',monospace;
+
+    --glow-green: 0 0 10px rgba(57,255,136,.45);
+    --glow-amber: 0 0 10px rgba(255,176,32,.45);
+    --glow-red:   0 0 12px rgba(255,68,68,.55);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 70% -10%, #12161b 0%, var(--bg) 60%);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* All numeric telemetry uses tabular figures so digits don't jitter. */
+  .num { font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+  /* ============================ Bezel panels ============================ */
+  .panel {
+    background: linear-gradient(180deg, var(--panel) 0%, #121519 100%);
+    border: 1px solid var(--edge);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.02),
+                0 2px 6px rgba(0,0,0,.45);
+    border-radius: 4px;   /* industrial: barely rounded */
+  }
+  .panel-hd {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--edge);
+    font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--slate);
+  }
+  .panel-hd .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--slate); }
+
+  /* ============================ Top command bar ============================ */
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--edge);
+    background: linear-gradient(180deg, #14171b, #0f1215);
+    position: sticky; top: 0; z-index: 40;
+  }
+  .brand { display: flex; align-items: center; gap: 13px; margin-right: auto; }
+  .brand .logo {
+    width: 34px; height: 34px; border-radius: 3px; flex: none;
+    border: 1px solid var(--edge-lit);
+    display: grid; place-items: center; font-size: 18px;
+    color: var(--green); text-shadow: var(--glow-green); font-weight: 700;
+  }
+  .brand-txt { display: flex; flex-direction: column; gap: 5px; }
+  .brand h1 { font-size: 18px; line-height: 1.15; letter-spacing: .1em; margin: 0; text-transform: uppercase; color: var(--ink); }
+  .brand .sub { font-size: 11px; line-height: 1.35; color: var(--slate); letter-spacing: .1em; }
+
+  input[type=text], input[type=number] {
+    background: #0c0e11; color: var(--ink);
+    border: 1px solid var(--edge-lit); border-radius: 3px;
+    font-family: var(--mono); font-size: 13px; padding: 7px 9px;
+    outline: none;
+  }
+  input[type=text]:focus, input[type=number]:focus { border-color: var(--slate); }
+
+  /* Labeled connection fields in the header */
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field > label { font-size: 8.5px; letter-spacing: .16em; color: var(--slate); text-transform: uppercase; padding-left: 2px; }
+  .field input { font-size: 12px; padding: 6px 8px; }
+
+  .btn {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .06em;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--edge-lit); border-radius: 3px;
+    padding: 7px 13px; cursor: pointer; text-transform: uppercase;
+    transition: border-color .15s, background .15s, color .15s;
+    user-select: none;
+  }
+  .btn:hover { border-color: var(--slate); }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { color: var(--green); border-color: rgba(57,255,136,.4); }
+  .btn.primary:hover { background: rgba(57,255,136,.08); }
+
+  /* Connection-status pill */
+  .status {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    padding: 6px 11px; border-radius: 3px;
+    border: 1px solid var(--edge-lit); background: #0c0e11;
+    white-space: nowrap;
+  }
+  .status .beacon { width: 9px; height: 9px; border-radius: 50%; background: var(--slate); }
+  .status[data-s="connected"]    { color: var(--green); border-color: rgba(57,255,136,.35); }
+  .status[data-s="connected"]    .beacon { background: var(--green); box-shadow: var(--glow-green); animation: pulse 2s infinite; }
+  .status[data-s="reconnecting"] { color: var(--amber); border-color: rgba(255,176,32,.35); }
+  .status[data-s="reconnecting"] .beacon { background: var(--amber); box-shadow: var(--glow-amber); animation: pulse .8s infinite; }
+  .status[data-s="simulation"]   { color: var(--blue); border-color: rgba(56,189,248,.35); }
+  .status[data-s="simulation"]   .beacon { background: var(--blue); box-shadow: 0 0 10px rgba(56,189,248,.5); animation: pulse 1.6s infinite; }
+  .status[data-s="disconnected"] { color: var(--slate); }
+
+  /* Simulation toggle switch */
+  .switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; user-select: none; font-size: 11px; letter-spacing: .1em; color: var(--slate); text-transform: uppercase; }
+  .switch .track { width: 40px; height: 20px; border-radius: 11px; background: #0c0e11; border: 1px solid var(--edge-lit); position: relative; transition: background .18s, border-color .18s; }
+  .switch .knob { position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; border-radius: 50%; background: var(--slate); transition: left .18s, background .18s; }
+  .switch.on .track { background: rgba(56,189,248,.18); border-color: rgba(56,189,248,.5); }
+  .switch.on .knob { left: 21px; background: var(--blue); box-shadow: 0 0 8px rgba(56,189,248,.6); }
+
+  /* ============================ Main grid ============================ */
+  main {
+    display: grid; gap: 12px; padding: 12px;
+    grid-template-columns: minmax(0,1fr) 320px;
+    grid-template-areas:
+      "video   sidebar"
+      "chart   sidebar"
+      "controls controls";
+  }
+  @media (max-width: 900px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-areas: "video" "sidebar" "chart" "controls";
+    }
+  }
+
+  /* ---- Video feed ---- */
+  .video { grid-area: video; overflow: hidden; position: relative; min-height: 320px; display: flex; flex-direction: column; }
+  .video .stage { position: relative; flex: 1; background: #060708; min-height: 300px; display: grid; place-items: center; overflow: hidden; }
+  #feed { width: 100%; height: 100%; object-fit: contain; display: none; }
+  /* Simulation "no signal" placeholder */
+  .nosignal {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    background:
+      repeating-linear-gradient(45deg, #0a0c0e 0 12px, #0d1013 12px 24px);
+    overflow: hidden;
+  }
+  .nosignal::before {
+    content: ""; position: absolute; inset: -50%;
+    background: linear-gradient(115deg, transparent 40%, rgba(56,189,248,.06) 50%, transparent 60%);
+    animation: sweep 3.2s linear infinite;
+  }
+  .nosignal .msg { text-align: center; z-index: 2; }
+  .nosignal .msg b { display: block; color: var(--blue); letter-spacing: .28em; font-size: 15px; text-shadow: 0 0 12px rgba(56,189,248,.4); }
+  .nosignal .msg span { color: var(--slate); letter-spacing: .18em; font-size: 11px; }
+  .scanline { position: absolute; left:0; right:0; height: 2px; background: rgba(56,189,248,.25); box-shadow: 0 0 8px rgba(56,189,248,.4); animation: scan 4s linear infinite; }
+
+  /* State + cycle overlay badges on the video */
+  .overlay { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; align-items: flex-start; pointer-events: none; z-index: 5; }
+  .state-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 13px; border-radius: 3px; font-size: 12px; letter-spacing: .12em;
+    background: rgba(9,11,13,.78); border: 1px solid var(--edge-lit);
+    backdrop-filter: blur(3px); text-transform: uppercase;
+  }
+  .state-badge .led { width: 9px; height: 9px; border-radius: 50%; background: var(--slate); }
+  .state-badge[data-st="PUMP_RUNNING"]  { color: var(--green); border-color: rgba(57,255,136,.4); }
+  .state-badge[data-st="PUMP_RUNNING"]  .led { background: var(--green); box-shadow: var(--glow-green); animation: pulse 1.4s infinite; }
+  .state-badge[data-st="ADAPTIVE_BREAK"]{ color: var(--amber); border-color: rgba(255,176,32,.4); }
+  .state-badge[data-st="ADAPTIVE_BREAK"] .led { background: var(--amber); box-shadow: var(--glow-amber); animation: pulse 1s infinite; }
+  .state-badge[data-st="BATCH_COMPLETE"]{ color: var(--blue); border-color: rgba(56,189,248,.4); }
+  .state-badge[data-st="BATCH_COMPLETE"] .led { background: var(--blue); box-shadow: 0 0 10px rgba(56,189,248,.5); }
+  .cycle-badge { padding: 8px 13px; border-radius: 3px; font-size: 12px; letter-spacing: .12em; background: rgba(9,11,13,.78); border: 1px solid var(--edge-lit); color: var(--ink); backdrop-filter: blur(3px); }
+  .cycle-badge b { color: var(--green); }
+
+  /* ---- Sidebar ---- */
+  .sidebar { grid-area: sidebar; display: flex; flex-direction: column; gap: 12px; }
+  .card { padding: 14px; }
+  .card .card-title { font-size: 10px; letter-spacing: .18em; color: var(--slate); text-transform: uppercase; margin-bottom: 10px; }
+
+  /* Arc gauge */
+  .gauge-wrap { display: flex; flex-direction: column; align-items: center; }
+  .gauge { position: relative; width: 180px; height: 150px; }
+  .gauge svg { width: 100%; height: 100%; }
+  .gauge .readout { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
+  .gauge .readout .big { font-size: 34px; font-weight: 700; letter-spacing: -.01em; line-height: 1; }
+  .gauge .readout .unit { font-size: 12px; color: var(--slate); margin-top: 2px; letter-spacing: .1em; }
+  .gauge-sub { display: flex; justify-content: space-between; width: 100%; font-size: 11px; color: var(--ink-dim); margin-top: 6px; }
+  .gauge-sub b { color: var(--ink); }
+
+  /* Countdown ring */
+  .ring-wrap { display: flex; flex-direction: column; align-items: center; }
+  .ring { position: relative; width: 168px; height: 168px; }
+  .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .ring .readout { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .ring .readout .big { font-size: 40px; font-weight: 700; line-height: 1; }
+  .ring .readout .lbl { font-size: 10px; letter-spacing: .18em; color: var(--slate); text-transform: uppercase; margin-top: 4px; }
+  .ring .readout .of { font-size: 11px; color: var(--ink-dim); margin-top: 2px; }
+  .clamp-flag { margin-top: 8px; font-size: 10px; letter-spacing: .12em; color: var(--amber); text-transform: uppercase; opacity: 0; transition: opacity .2s; text-align: center; }
+  .clamp-flag.show { opacity: 1; }
+
+  /* System status rows */
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; padding: 9px 0; border-bottom: 1px dashed var(--edge); }
+  .stat-row:last-child { border-bottom: 0; }
+  .stat-row .k { font-size: 11px; letter-spacing: .1em; color: var(--slate); text-transform: uppercase; }
+  .stat-row .v { font-size: 18px; font-weight: 600; }
+  .stat-row .v small { font-size: 11px; color: var(--ink-dim); font-weight: 400; margin-left: 3px; }
+
+  /* Reaction status (pink-detection) card */
+  .mini-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--slate); margin-left: 7px; vertical-align: middle; }
+  .mini-dot.live { background: var(--green); box-shadow: var(--glow-green); animation: pulse 2s infinite; }
+  .reaction { display: flex; flex-direction: column; gap: 11px; }
+  .reaction-state { font-size: 21px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; text-align: center; padding: 10px; border-radius: 3px; border: 1px solid var(--edge-lit); transition: color .25s, border-color .25s, box-shadow .25s; }
+  .reaction-state[data-rs="idle"]     { color: var(--slate); }
+  .reaction-state[data-rs="reacting"] { color: var(--pink);  border-color: rgba(255,92,200,.45); box-shadow: inset 0 0 20px rgba(255,92,200,.09); }
+  .reaction-state[data-rs="clearing"] { color: var(--amber); border-color: rgba(255,176,32,.45); }
+  .reaction-state[data-rs="complete"] { color: var(--green); border-color: rgba(57,255,136,.5);  box-shadow: inset 0 0 20px rgba(57,255,136,.12); }
+  .pink-meter { height: 10px; background: #0c0e11; border: 1px solid var(--edge-lit); border-radius: 5px; overflow: hidden; }
+  .pink-fill { height: 100%; width: 0%; background: var(--pink); box-shadow: 0 0 8px rgba(255,92,200,.5); transition: width .3s ease, background .3s; }
+  .pink-sub { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink-dim); letter-spacing: .06em; }
+  .pink-sub b { color: var(--ink); }
+
+  /* ---- Chart ---- */
+  .chart-panel { grid-area: chart; padding: 0; display: flex; flex-direction: column; }
+  .chart-legend { display: flex; gap: 18px; padding: 8px 14px; border-bottom: 1px solid var(--edge); font-size: 11px; letter-spacing: .08em; }
+  .chart-legend .lg { display: inline-flex; align-items: center; gap: 7px; color: var(--ink-dim); text-transform: uppercase; }
+  .chart-legend .lg i { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+  .chart-box { position: relative; height: 220px; padding: 8px 10px 12px; }
+
+  /* ---- Controls ---- */
+  .controls { grid-area: controls; }
+  .controls-grid { display: grid; grid-template-columns: 260px 1fr; gap: 14px; padding: 14px; }
+  @media (max-width: 720px) { .controls-grid { grid-template-columns: 1fr; } }
+
+  .tuning { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 22px; align-items: start; }
+  @media (max-width: 520px) { .tuning { grid-template-columns: 1fr; } }
+
+  .ctrl label.name { display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; letter-spacing: .1em; color: var(--slate); text-transform: uppercase; margin-bottom: 9px; }
+  .ctrl label.name .val { color: var(--green); font-size: 15px; font-weight: 700; letter-spacing: 0; }
+  .ctrl label.name .val small { color: var(--ink-dim); font-weight: 400; font-size: 11px; }
+
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px; background: #0c0e11; border: 1px solid var(--edge-lit); outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--green); border: 2px solid #0d0f12; box-shadow: var(--glow-green); cursor: pointer; }
+  input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--green); border: 2px solid #0d0f12; box-shadow: var(--glow-green); cursor: pointer; }
+
+  /* Algorithm segmented toggle */
+  .seg { display: inline-flex; border: 1px solid var(--edge-lit); border-radius: 3px; overflow: hidden; }
+  .seg button { font-family: var(--mono); background: transparent; color: var(--slate); border: 0; padding: 8px 14px; cursor: pointer; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+  .seg button.active { background: rgba(57,255,136,.12); color: var(--green); }
+  .manual-box { margin-top: 12px; display: none; }
+  .manual-box.show { display: block; }
+  .manual-box .hint { font-size: 10px; color: var(--ink-dim); margin-top: 6px; letter-spacing: .04em; }
+
+  /* ---- Kill switch (isolated) ---- */
+  .killzone {
+    border: 1px solid rgba(255,68,68,.28); border-radius: 4px;
+    background:
+      repeating-linear-gradient(45deg, rgba(255,68,68,.04) 0 10px, transparent 10px 20px),
+      #121316;
+    padding: 14px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .killzone .kz-hd { font-size: 10px; letter-spacing: .2em; color: var(--red); text-transform: uppercase; display: flex; align-items: center; gap: 8px; }
+  .power-btn {
+    font-family: var(--mono); cursor: pointer; user-select: none;
+    border-radius: 4px; padding: 18px 12px; text-align: center;
+    font-size: 15px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700;
+    border: 1px solid var(--edge-lit); transition: all .15s; position: relative; overflow: hidden;
+  }
+  /* powered / running -> big green ONLINE, click arms shutdown */
+  .power-btn[data-mode="on"]   { color: var(--green); border-color: rgba(57,255,136,.5); background: rgba(57,255,136,.06); box-shadow: inset 0 0 22px rgba(57,255,136,.08); }
+  .power-btn[data-mode="arm"]  { color: #0d0f12; background: var(--amber); border-color: var(--amber); box-shadow: var(--glow-amber); animation: armpulse .7s infinite; }
+  .power-btn[data-mode="off"]  { color: var(--red); border-color: rgba(255,68,68,.55); background: rgba(255,68,68,.08); box-shadow: inset 0 0 22px rgba(255,68,68,.1); }
+  .power-btn small { display: block; font-size: 10px; letter-spacing: .12em; font-weight: 400; margin-top: 5px; opacity: .8; }
+  .arm-timer { height: 3px; background: var(--red); width: 100%; transform-origin: left; }
+
+  /* ============================ Keyframes ============================ */
+  @keyframes pulse   { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  @keyframes armpulse{ 0%,100% { box-shadow: var(--glow-amber); } 50% { box-shadow: 0 0 20px rgba(255,176,32,.8); } }
+  @keyframes sweep   { from { transform: translateX(-30%); } to { transform: translateX(30%); } }
+  @keyframes scan    { from { top: -2px; } to { top: 100%; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+
+  /* Faint footer note */
+  footer { padding: 8px 14px 18px; color: var(--slate); font-size: 10px; letter-spacing: .1em; text-align: center; }
+  footer code { color: var(--ink-dim); }
+</style>
+
+<!-- ============================ MARKUP ============================ -->
+<header>
+  <div class="brand">
+    <div class="logo">⧗</div>
+    <div class="brand-txt">
+      <h1>Bioreactor&nbsp;Control</h1>
+      <div class="sub">ESP32-CAM · ADAPTIVE PUMP CONTROLLER</div>
+    </div>
+  </div>
+
+  <div class="field">
+    <label for="hostInput">Telemetry WS</label>
+    <input id="hostInput" type="text" value="ws://192.168.4.1/ws" size="20" aria-label="Device WebSocket URL" />
+  </div>
+  <div class="field">
+    <label for="camInput">Camera Stream URL</label>
+    <input id="camInput" type="text" value="http://172.20.10.12:81/stream" size="24" aria-label="Camera MJPEG stream URL" />
+  </div>
+  <div class="field">
+    <label for="pinkInput">Pink Detector</label>
+    <input id="pinkInput" type="text" value="ws://localhost:8765" size="16" aria-label="Pink detector bridge WebSocket URL" />
+  </div>
+  <button id="connectBtn" class="btn primary">Connect</button>
+
+  <label class="switch" id="simSwitch" title="Run mock telemetry with no backend">
+    <span class="track"><span class="knob"></span></span>
+    <span>Sim</span>
+  </label>
+
+  <div class="status" id="statusPill" data-s="disconnected">
+    <span class="beacon"></span><span id="statusText">Disconnected</span>
+  </div>
+</header>
+
+<main>
+  <!-- ================= VIDEO ================= -->
+  <section class="panel video">
+    <div class="panel-hd"><span class="dot"></span> Live Feed · MJPEG</div>
+    <div class="stage">
+      <div class="overlay">
+        <div class="state-badge" id="stateBadge" data-st="PUMP_RUNNING">
+          <span class="led"></span><span id="stateText">STANDBY</span>
+        </div>
+        <div class="cycle-badge">Cycle <b id="cycleNow">–</b> / <span id="cycleTotal">–</span></div>
+      </div>
+
+      <!-- Decoupled MJPEG element: src is set ONCE on connect, never touched on ticks -->
+      <img id="feed" alt="Reactor camera feed" />
+
+      <!-- Placeholder shown whenever there is no live MJPEG source -->
+      <div class="nosignal" id="noSignal">
+        <div class="scanline"></div>
+        <div class="msg">
+          <b>NO&nbsp;SIGNAL</b>
+          <span id="noSignalSub">AWAITING CONNECTION</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SIDEBAR ================= -->
+  <aside class="sidebar">
+    <!-- Oxygen Saturation gauge -->
+    <div class="panel card">
+      <div class="card-title">Oxygen Saturation Index</div>
+      <div class="gauge-wrap">
+        <div class="gauge">
+          <svg viewBox="0 0 180 150">
+            <!-- 270° arc: track + value; rotate(135) places gap at bottom -->
+            <g transform="rotate(135 90 82)">
+              <circle cx="90" cy="82" r="64" fill="none" stroke="#0c0e11" stroke-width="14"
+                      stroke-linecap="round" stroke-dasharray="301.6 2000"/>
+              <circle id="satArc" cx="90" cy="82" r="64" fill="none" stroke="var(--green)" stroke-width="14"
+                      stroke-linecap="round" stroke-dasharray="0 2000"
+                      style="transition: stroke-dasharray .25s ease, stroke .25s;"/>
+            </g>
+          </svg>
+          <div class="readout">
+            <div class="big num" id="satVal">–</div>
+            <div class="unit">% SAT</div>
+          </div>
+        </div>
+        <div class="gauge-sub">
+          <span>HUE <b class="num" id="hueVal">–</b></span>
+          <span>TGT <b class="num" id="targetHueVal">120</b></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dynamic break countdown -->
+    <div class="panel card">
+      <div class="card-title">Dynamic Break Countdown</div>
+      <div class="ring-wrap">
+        <div class="ring">
+          <svg viewBox="0 0 168 168">
+            <circle cx="84" cy="84" r="72" fill="none" stroke="#0c0e11" stroke-width="12"/>
+            <circle id="breakRing" cx="84" cy="84" r="72" fill="none" stroke="var(--amber)" stroke-width="12"
+                    stroke-linecap="round" stroke-dasharray="452.4" stroke-dashoffset="452.4"
+                    style="transition: stroke-dashoffset .25s linear, stroke .25s;"/>
+          </svg>
+          <div class="readout">
+            <div class="big num" id="breakRemain">--</div>
+            <div class="lbl">Sec Remaining</div>
+            <div class="of">of <span class="num" id="breakTotal">--</span>s</div>
+          </div>
+        </div>
+        <div class="clamp-flag" id="clampFlag">⚠ At safety clamp edge</div>
+      </div>
+    </div>
+
+    <!-- System status -->
+    <div class="panel card">
+      <div class="card-title">System Status</div>
+      <div class="stat-row">
+        <span class="k">Fluid Temp</span>
+        <span class="v num" id="tempVal">–<small>°C</small></span>
+      </div>
+      <div class="stat-row">
+        <span class="k">Recovery Rate</span>
+        <span class="v num" id="recoveryVal">–<small>×</small></span>
+      </div>
+      <div class="stat-row">
+        <span class="k">PWM Output</span>
+        <span class="v num" id="pwmVal">–<small>/255</small></span>
+      </div>
+    </div>
+
+    <!-- Reaction status (pink → colourless detection) -->
+    <div class="panel card">
+      <div class="card-title">Reaction Status<span class="mini-dot" id="pinkBridgeDot" title="Pink detector bridge: offline"></span></div>
+      <div class="reaction">
+        <div class="reaction-state" id="reactionState" data-rs="idle">IDLE</div>
+        <div class="pink-meter"><div class="pink-fill" id="pinkFill"></div></div>
+        <div class="pink-sub">
+          <span>PINK <b class="num" id="pinkPctVal">–</b> %</span>
+          <span>complete &lt; <span class="num">15</span>%</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ================= CHART ================= -->
+  <section class="panel chart-panel">
+    <div class="panel-hd"><span class="dot"></span> Cycle Graph · Rolling 120pt</div>
+    <div class="chart-legend">
+      <span class="lg"><i style="background:var(--green)"></i> Pump PWM · 0–255 (L)</span>
+      <span class="lg"><i style="background:var(--blue)"></i> O₂ Saturation · % (R)</span>
+    </div>
+    <div class="chart-box"><canvas id="cycleChart"></canvas></div>
+  </section>
+
+  <!-- ================= CONTROLS ================= -->
+  <section class="panel controls">
+    <div class="panel-hd"><span class="dot"></span> Controls · Write</div>
+    <div class="controls-grid">
+
+      <!-- Kill switch, visually isolated -->
+      <div class="killzone">
+        <div class="kz-hd">◈ System Power · E-Stop</div>
+        <div class="power-btn" id="powerBtn" data-mode="off" role="button" tabindex="0" aria-label="System power">
+          <span id="powerLabel">OFFLINE</span>
+          <small id="powerHint">Click to power on</small>
+          <div class="arm-timer" id="armTimer" style="display:none"></div>
+        </div>
+      </div>
+
+      <!-- Tuning cluster (lower risk) -->
+      <div class="tuning">
+        <!-- Target saturation -->
+        <div class="ctrl">
+          <label class="name" for="satSlider">Target Saturation
+            <span class="val"><span class="num" id="satSliderVal">85</span>%</span>
+          </label>
+          <input type="range" id="satSlider" min="0" max="100" step="1" value="85" />
+        </div>
+
+        <!-- Base pump speed -->
+        <div class="ctrl">
+          <label class="name" for="pwmSlider">Base Pump Speed
+            <span class="val"><span class="num" id="pwmSliderVal">180</span><small class="num" id="pwmSliderPct"> · 71%</small></span>
+          </label>
+          <input type="range" id="pwmSlider" min="0" max="255" step="1" value="180" />
+        </div>
+
+        <!-- Algorithm mode -->
+        <div class="ctrl" style="grid-column:1 / -1">
+          <label class="name">Algorithm Mode</label>
+          <div class="seg" id="algoSeg">
+            <button data-mode="adaptive" class="active">Smart Adaptive</button>
+            <button data-mode="manual">Fixed Manual</button>
+          </div>
+          <div class="manual-box" id="manualBox">
+            <label class="name" for="manualBreak">Manual Break Length
+              <span class="val"><span class="num" id="manualBreakEcho">20</span>s</span>
+            </label>
+            <input type="number" id="manualBreak" min="5" max="45" step="0.5" value="20" style="width:110px" />
+            <div class="hint">Clamped client-side to firmware bounds MIN_BREAK 5s – MAX_BREAK 45s.</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+</main>
+
+<footer>
+  ESP32-CAM Bioreactor Dashboard · WebSocket <code>ws://&lt;device-ip&gt;/ws</code> · MJPEG <code>http://&lt;device-ip&gt;/stream</code>
+</footer>
+
+<!-- ============================ SCRIPT ============================ -->
+<script>
+"use strict";
+/* =====================================================================
+ *  Firmware-shared constants (source of truth lives on the ESP32; these
+ *  mirror the known bounds so the UI can clamp and colour correctly).
+ * ===================================================================== */
+const MIN_BREAK   = 5;      // seconds  (firmware MIN_BREAK)
+const MAX_BREAK   = 45;     // seconds  (firmware MAX_BREAK)
+const TARGET_HUE  = 120.0;  // firmware targetColorHue
+const BASE_RECOVERY_RATE = 1.5;   // firmware baseRecoveryRate (O2 units/s from air stone)
+const MAX_POINTS  = 180;    // rolling chart window (~45s @ 4Hz — shows a full cycle)
+const CHART_HZ    = 4;      // max chart redraws / second
+const RING_LEN    = 452.4;  // 2πr for r=72 (break ring)
+const SAT_ARC_LEN = 301.6;  // 0.75 * 2πr for r=64 (270° gauge)
+
+/* Hardware parameters from ariduin0code.cpp — used to ground the Sim O2 model. */
+const VOLUME_L         = 1.0;   // reactor volume (L)
+const AIR_PUMP_FLOW_LPM = 2.0;  // air-stone flow (L/min)
+const PUMP_RUN_TIME_S   = 5.0;  // PUMP_RUN_TIME_MS / 1000 — dosing phase length
+// O2 ↔ PWM are INVERSE (per ariduin0code): pump ON consumes O2 (hue falls); pump
+// OFF lets the air stone recover it (hue rises). Sized so the swing is clearly
+// visible on the graph, not a small wiggle pinned near 100%.
+const O2_DRAW_PER_S     = 11.0; // hue units/s consumed at full PWM while dosing
+const O2_CRASH_HUE      = 62.0; // deep safety floor — dosing stops if O2 crashes here
+
+/* Pink-detection thresholds (mirror pink_detection.py MAJORITY_THRESHOLD). */
+const PINK_MAJORITY = 40.0;  // ≥ this % pink → reaction still active
+const PINK_CLEAR    = 15.0;  // < this % pink (after being pink) → reaction complete
+
+/* =====================================================================
+ *  Central UI state. Telemetry writes here; renderers read from here.
+ * ===================================================================== */
+const ui = {
+  targetSaturation: 85,
+  basePWM:          180,
+  algorithmMode:    "adaptive",   // adaptive | manual
+  manualBreak:      20,
+  connMode:         "disconnected", // disconnected | connected | reconnecting | simulation
+};
+
+/* short DOM helpers */
+const $ = (id) => document.getElementById(id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+/* =====================================================================
+ *  SECTION 1 — Connection status + transport switching
+ * ===================================================================== */
+function setStatus(mode, textOverride) {
+  ui.connMode = mode;
+  const pill = $("statusPill");
+  const map = {
+    connected:    "Connected",
+    reconnecting: "Reconnecting…",
+    simulation:   "Simulation",
+    disconnected: "Disconnected",
+  };
+  pill.dataset.s = mode;
+  $("statusText").textContent = textOverride || map[mode] || mode;
+}
+
+/* =====================================================================
+ *  SECTION 2 — Inbound message dispatch
+ *  handleInbound() is the single entry point for BOTH real WS frames and
+ *  simulated frames, so the two paths render identically.
+ * ===================================================================== */
+function handleInbound(msg) {
+  if (!msg || typeof msg !== "object") return;
+  switch (msg.type) {
+    case "telemetry": renderTelemetry(msg); break;
+    case "pink":      renderReaction(msg.pinkPercentage); break;   // from the pink bridge
+    // Extend here (e.g. "event", "log") without touching the socket layer.
+    default:
+      // Unknown message types are ignored but logged for debugging.
+      console.debug("[inbound] unhandled type:", msg.type);
+  }
+}
+
+/* =====================================================================
+ *  SECTION 3 — Telemetry rendering (gauges, cards, badges, chart buffer)
+ * ===================================================================== */
+let lastTelemetry = null;
+
+function renderTelemetry(t) {
+  lastTelemetry = t;
+
+  /* -- State badge + cycle overlay -- */
+  const badge = $("stateBadge");
+  if (t.state) { badge.dataset.st = t.state; $("stateText").textContent = t.state; }
+  if (t.cycle != null)      $("cycleNow").textContent   = t.cycle;
+  if (t.cycleTotal != null) $("cycleTotal").textContent = t.cycleTotal;
+
+  /* -- Oxygen saturation gauge -- */
+  if (t.saturationPct != null) {
+    const s = clamp(t.saturationPct, 0, 100);
+    $("satVal").textContent = s.toFixed(1);
+    $("satArc").setAttribute("stroke-dasharray", `${(s/100)*SAT_ARC_LEN} 2000`);
+    // Colour the arc by health relative to target.
+    const arc = $("satArc");
+    if (s >= ui.targetSaturation)          arc.style.stroke = "var(--green)";
+    else if (s >= ui.targetSaturation*0.7) arc.style.stroke = "var(--amber)";
+    else                                    arc.style.stroke = "var(--red)";
+  }
+  if (t.hue != null)       $("hueVal").textContent       = t.hue.toFixed(1);
+  if (t.targetHue != null) $("targetHueVal").textContent = t.targetHue.toFixed(0);
+
+  /* -- Break countdown ring -- */
+  if (t.breakDurationSeconds != null) $("breakTotal").textContent = t.breakDurationSeconds.toFixed(1);
+  if (t.breakRemainingSeconds != null) {
+    const total  = t.breakDurationSeconds || 0;
+    const remain = clamp(t.breakRemainingSeconds, 0, total || t.breakRemainingSeconds);
+    $("breakRemain").textContent = remain.toFixed(1);
+    const frac = total > 0 ? remain / total : 0;
+    $("breakRing").setAttribute("stroke-dashoffset", RING_LEN * (1 - frac));
+    // Ring turns red in the final stretch of the countdown.
+    $("breakRing").style.stroke = (frac <= 0.25 && total > 0) ? "var(--red)" : "var(--amber)";
+  }
+  // Flag when the (manual) break sits at a safety clamp edge.
+  const atEdge = t.breakDurationSeconds != null &&
+                 (t.breakDurationSeconds <= MIN_BREAK + 0.05 || t.breakDurationSeconds >= MAX_BREAK - 0.05);
+  $("clampFlag").classList.toggle("show", !!atEdge && t.algorithmMode === "manual");
+
+  /* -- System status card -- */
+  if (t.fluidTemperature != null)       $("tempVal").innerHTML     = `${t.fluidTemperature.toFixed(1)}<small>°C</small>`;
+  if (t.recoveryRateEffective != null)  $("recoveryVal").innerHTML = `${t.recoveryRateEffective.toFixed(2)}<small>×</small>`;
+  if (t.pumpPWM != null)                $("pwmVal").innerHTML       = `${Math.round(t.pumpPWM)}<small>/255</small>`;
+
+  /* -- Reflect authoritative power state on the kill switch (unless mid-arm) -- */
+  if (t.systemPowered != null && powerArmState !== "arm") {
+    setPowerVisual(t.systemPowered ? "on" : "off");
+  }
+
+  /* -- Reaction status if pink% rides along in telemetry (else it comes from the bridge) -- */
+  if (t.pinkPercentage != null) renderReaction(t.pinkPercentage);
+
+  /* -- Buffer point for the throttled chart flush -- */
+  if (t.pumpPWM != null || t.saturationPct != null) {
+    chartBuffer.push({ pwm: t.pumpPWM, sat: t.saturationPct });
+  }
+}
+
+/* =====================================================================
+ *  SECTION 3b — Reaction status (pink → colourless) renderer
+ *  Shared by the pink bridge, telemetry, and Simulation Mode.
+ * ===================================================================== */
+let pinkSeenHigh = false;    // has the solution been majority-pink this run?
+let reactionComplete = false;
+
+function renderReaction(pinkPct) {
+  if (pinkPct == null || isNaN(pinkPct)) return;
+  pinkPct = clamp(pinkPct, 0, 100);
+  $("pinkPctVal").textContent = pinkPct.toFixed(0);
+  $("pinkFill").style.width = pinkPct + "%";
+
+  let rs;
+  if (pinkPct >= PINK_MAJORITY)      { pinkSeenHigh = true; reactionComplete = false; rs = "reacting"; }
+  else if (pinkPct >= PINK_CLEAR)    { rs = pinkSeenHigh ? "clearing" : "idle"; }
+  else                               { if (pinkSeenHigh) { reactionComplete = true; rs = "complete"; } else rs = "idle"; }
+
+  const el = $("reactionState");
+  el.dataset.rs = rs;
+  el.textContent = { reacting: "REACTING", clearing: "CLEARING…", complete: "COMPLETE", idle: "IDLE" }[rs];
+  $("pinkFill").style.background = rs === "complete" ? "var(--green)" : "var(--pink)";
+}
+
+function resetReaction() {
+  pinkSeenHigh = false; reactionComplete = false;
+  renderReaction(0);
+}
+
+/* Pink-bridge connection indicator. */
+function setPinkBridge(live) {
+  const dot = $("pinkBridgeDot");
+  dot.classList.toggle("live", !!live);
+  dot.title = live ? "Pink detector bridge: connected" : "Pink detector bridge: offline";
+}
+
+/* =====================================================================
+ *  SECTION 4 — Outbound command sender
+ * ===================================================================== */
+function sendCommand(action, value) {
+  const packet = { type: "command", action, value };
+  // Local echo so simulation reacts immediately.
+  applyCommandLocally(action, value);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(packet)); }
+    catch (e) { console.warn("[send] failed:", e); }
+  }
+  console.debug("[command]", action, value);
+}
+
+/* Mirror command effects into local UI state (drives simulation + labels). */
+function applyCommandLocally(action, value) {
+  switch (action) {
+    case "setTargetSaturation": ui.targetSaturation = value; break;
+    case "setBasePumpPWM":      ui.basePWM = value; break;
+    case "setAlgorithmMode":    ui.algorithmMode = value; break;
+    case "setManualBreakSeconds": ui.manualBreak = value; break;
+    case "setPower":            /* handled by kill-switch visual */ break;
+  }
+}
+
+/* =====================================================================
+ *  SECTION 5 — WebSocket transport with exponential-backoff reconnect
+ *  NOTE: the MJPEG <img> is intentionally NOT managed here on a per-frame
+ *  basis; its src is set exactly once in openStream().
+ * ===================================================================== */
+let ws = null;
+let reconnectDelay = 1000;         // starts 1s
+const RECONNECT_CAP = 10000;       // caps 10s
+let reconnectTimer = null;
+let linkActive = false;         // true while the user intends a live device link
+let currentUrl = null;
+
+/* User-initiated connect — brings up telemetry WS + pink bridge. (Camera runs
+   independently, from boot.) */
+function connect(url) {
+  currentUrl = url;
+  linkActive = true;
+  stopSimulation();               // a real link always wins over sim
+  startCameraFeed();              // ensure the camera feed is live/retrying
+  resetReaction();
+  connectPink();                  // pink-detector bridge (its own socket)
+  attempt(false);
+}
+
+/* One connection attempt. isRetry separates the first connect from a backoff retry. */
+function attempt(isRetry) {
+  clearTimeout(reconnectTimer);
+  // Drop any previous socket WITHOUT letting its onclose schedule a reconnect.
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (_) {} }
+
+  setStatus("reconnecting", isRetry ? "Reconnecting…" : "Connecting…");
+  try {
+    ws = new WebSocket(currentUrl);
+  } catch (e) {
+    console.warn("[ws] bad URL:", e);
+    linkActive = false;
+    setStatus("disconnected");
+    return;
+  }
+
+  ws.onopen = () => {
+    reconnectDelay = 1000;        // reset backoff on a clean connect
+    setStatus("connected");
+  };
+
+  ws.onmessage = (ev) => {
+    // Guard against malformed / partial frames — never throw.
+    let msg;
+    try { msg = JSON.parse(ev.data); }
+    catch (e) { console.warn("[ws] dropped malformed frame:", e); return; }
+    handleInbound(msg);
+  };
+
+  ws.onclose = () => {
+    // Camera is independent — leave it running so video survives a telemetry drop.
+    if (!linkActive) { setStatus("disconnected"); return; }
+    scheduleReconnect();
+  };
+
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };  // -> onclose -> reconnect
+}
+
+/* Exponential backoff, capped. */
+function scheduleReconnect() {
+  setStatus("reconnecting", "Reconnecting…");
+  reconnectTimer = setTimeout(() => attempt(true), reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_CAP);
+}
+
+/* User-initiated disconnect — tears down telemetry WS + pink bridge, cancels
+   any pending reconnect. (Camera keeps running independently.) */
+function disconnect() {
+  linkActive = false;
+  clearTimeout(reconnectTimer);
+  reconnectDelay = 1000;
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (_) {} }
+  ws = null;
+  disconnectPink();
+  setStatus("disconnected");
+}
+
+/* =====================================================================
+ *  SECTION 5b — MJPEG camera feed (independent of telemetry)
+ *  Reads the URL from the editable "Camera Stream URL" field, loads it into
+ *  the <img>, and RETRIES on a timer until the camera comes online — so it is
+ *  "up and ready" and appears the moment the ESP32-CAM is switched on.
+ *  Fully decoupled from the WebSocket/chart loop (never touched on telemetry).
+ * ===================================================================== */
+/* The ESP32-CAM /stream endpoint serves MJPEG (multipart/x-mixed-replace with
+   image/jpeg parts): the firmware captures RGB565 but converts each frame to JPEG
+   on-device via frame2jpg() before sending (see cameratransmission/app_httpd.cpp).
+   So a plain <img> renders it directly — no RGB565 decoding needed. */
+const CAMERA_RETRY_MS  = 4000;   // wait before re-trying after the camera looks offline
+const CAMERA_PROBE_MS  = 400;    // how often to check whether a frame has decoded yet
+const CAMERA_GIVEUP_MS = 6000;   // no decoded frame within this window → offline, retry
+let cameraActive = false;
+let cameraRetryTimer = null;
+let cameraProbeTimer = null;
+let cameraLoadStart = 0;
+
+function startCameraFeed() {
+  cameraActive = true;
+  clearTimeout(cameraRetryTimer);   // cancel any loop from a previous URL
+  clearTimeout(cameraProbeTimer);
+  const img = $("feed");
+  // onload fires per frame in Chrome/Firefox for MJPEG; Safari may not — the probe
+  // loop below covers every browser by checking naturalWidth directly.
+  img.onload  = () => { if (img.naturalWidth > 0) revealCamera(); };
+  img.onerror = () => { showWaiting("CAMERA OFFLINE — RETRYING"); scheduleCameraRetry(); };
+  loadCameraFrame();
+}
+
+function loadCameraFrame() {
+  if (!cameraActive) return;
+  const url = $("camInput").value.trim();
+  if (!url) { showWaiting("ENTER CAMERA URL"); return; }
+  const img = $("feed");
+  clearTimeout(cameraProbeTimer);
+  showWaiting("CONNECTING VIDEO…");
+  cameraLoadStart = Date.now();
+  // MJPEG is a live, non-cacheable stream, so the URL is used verbatim — no query
+  // string (some camera firmwares choke on one). Clearing src forces a fresh request.
+  img.removeAttribute("src");
+  img.src = url;
+  probeCameraFrame();
+}
+
+/* Reveal ONLY once a real frame has decoded (naturalWidth > 0). This avoids the old
+   bug where the <img> was shown blank after a fixed delay even if the stream had
+   connected but delivered no frames (e.g. camera busy / another client holding it). */
+function probeCameraFrame() {
+  if (!cameraActive) return;
+  const img = $("feed");
+  if (img.naturalWidth > 0) { revealCamera(); return; }
+  if (Date.now() - cameraLoadStart > CAMERA_GIVEUP_MS) {
+    showWaiting("WAITING FOR CAMERA…");
+    scheduleCameraRetry();
+    return;
+  }
+  cameraProbeTimer = setTimeout(probeCameraFrame, CAMERA_PROBE_MS);
+}
+
+function revealCamera() {
+  if (!cameraActive) return;
+  clearTimeout(cameraProbeTimer);
+  const img = $("feed");
+  if (img.style.display !== "block") {
+    img.style.display = "block";
+    $("noSignal").style.display = "none";
+  }
+}
+
+function showWaiting(msg) {
+  $("feed").style.display = "none";
+  $("noSignal").style.display = "grid";
+  $("noSignalSub").textContent = msg;
+}
+
+function scheduleCameraRetry() {
+  clearTimeout(cameraRetryTimer);
+  if (!cameraActive) return;
+  cameraRetryTimer = setTimeout(loadCameraFrame, CAMERA_RETRY_MS);
+}
+
+function stopCameraFeed() {
+  cameraActive = false;
+  clearTimeout(cameraRetryTimer);
+  clearTimeout(cameraProbeTimer);
+  const img = $("feed");
+  img.onload = null; img.onerror = null;
+  img.removeAttribute("src");
+  img.style.display = "none";
+  $("noSignal").style.display = "grid";
+  $("noSignalSub").textContent = "CAMERA STOPPED";
+}
+
+/* =====================================================================
+ *  SECTION 5c — Pink-detector bridge (separate WebSocket)
+ *  pink_detection.py runs on a host, analyses the camera stream, and pushes
+ *  { type:"pink", pinkPercentage, pinkDetected } frames here.
+ * ===================================================================== */
+let pinkWs = null;
+let pinkActive = false;
+let pinkRetryTimer = null;
+
+function connectPink() {
+  const url = $("pinkInput").value.trim();
+  if (!url) return;
+  pinkActive = true;
+  clearTimeout(pinkRetryTimer);
+  try { if (pinkWs) { pinkWs.onclose = null; pinkWs.close(); } } catch (_) {}
+  try { pinkWs = new WebSocket(url); }
+  catch (e) { console.warn("[pink] bad URL:", e); setPinkBridge(false); return; }
+
+  pinkWs.onopen = () => setPinkBridge(true);
+  pinkWs.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    handleInbound(m);   // routes "pink" → renderReaction()
+  };
+  pinkWs.onclose = () => {
+    setPinkBridge(false);
+    if (pinkActive) pinkRetryTimer = setTimeout(connectPink, 3000);  // simple retry
+  };
+  pinkWs.onerror = () => { try { pinkWs.close(); } catch (_) {} };
+}
+
+function disconnectPink() {
+  pinkActive = false;
+  clearTimeout(pinkRetryTimer);
+  try { if (pinkWs) { pinkWs.onclose = null; pinkWs.close(); } } catch (_) {}
+  pinkWs = null;
+  setPinkBridge(false);
+}
+
+/* =====================================================================
+ *  SECTION 6 — Throttled chart (buffer points, flush at CHART_HZ)
+ * ===================================================================== */
+let chart = null;
+let chartBuffer = [];
+
+function initChart() {
+  const ctx = $("cycleChart").getContext("2d");
+  const grid = "rgba(90,122,138,.14)";
+  const tick = "#5a7a8a";
+  chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "Pump PWM", data: [], yAxisID: "yPWM", borderColor: "#39ff88",
+          backgroundColor: "rgba(57,255,136,.05)", borderWidth: 2, pointRadius: 0,
+          tension: .25, fill: false },
+        { label: "O₂ Saturation", data: [], yAxisID: "ySat", borderColor: "#38bdf8",
+          backgroundColor: "rgba(56,189,248,.05)", borderWidth: 2, pointRadius: 0,
+          tension: .25, fill: false },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      animation: false,                 // never animate per-frame — protects video loop
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { display: false },     // custom legend in markup
+        tooltip: {
+          backgroundColor: "#0c0e11", borderColor: "#2f3742", borderWidth: 1,
+          titleColor: "#8a97a0", bodyColor: "#d7e0e6",
+          titleFont: { family: "monospace" }, bodyFont: { family: "monospace" },
+          callbacks: {
+            label: (c) => c.datasetIndex === 0
+              ? ` PWM ${Math.round(c.parsed.y)} / 255`
+              : ` Sat ${c.parsed.y.toFixed(1)} %`,
+          },
+        },
+      },
+      scales: {
+        x: { grid: { color: grid }, ticks: { color: tick, maxTicksLimit: 8, font: { family: "monospace", size: 10 } } },
+        yPWM: { position: "left",  min: 0, max: 255, grid: { color: grid },
+                ticks: { color: "#39ff88", font: { family: "monospace", size: 10 } },
+                title: { display: true, text: "PWM", color: "#39ff88", font: { family: "monospace", size: 10 } } },
+        ySat: { position: "right", min: 0, max: 100, grid: { drawOnChartArea: false },
+                ticks: { color: "#38bdf8", font: { family: "monospace", size: 10 } },
+                title: { display: true, text: "% SAT", color: "#38bdf8", font: { family: "monospace", size: 10 } } },
+      },
+    },
+  });
+}
+
+/* Flush buffered telemetry into the chart at a fixed cadence, independent
+ * of how fast frames arrive. Uses update("none") to skip animation. */
+function flushChart() {
+  if (!chart || chartBuffer.length === 0) return;
+  const { labels } = chart.data;
+  const dPWM = chart.data.datasets[0].data;
+  const dSat = chart.data.datasets[1].data;
+
+  for (const p of chartBuffer) {
+    labels.push(new Date().toLocaleTimeString([], { hour12: false }));
+    dPWM.push(p.pwm != null ? p.pwm : null);
+    dSat.push(p.sat != null ? p.sat : null);
+  }
+  chartBuffer = [];
+
+  // Trim to rolling window.
+  while (labels.length > MAX_POINTS) { labels.shift(); dPWM.shift(); dSat.shift(); }
+  chart.update("none");
+}
+setInterval(flushChart, 1000 / CHART_HZ);
+
+/* =====================================================================
+ *  SECTION 7 — Simulation Mode
+ *  Emits telemetry through handleInbound() so it shares the render path.
+ *  Mimics calculateAdaptiveBreak(): hue deficit vs target, temperature-
+ *  derated recovery, 1.2x safety buffer, clamped [MIN_BREAK, MAX_BREAK].
+ * ===================================================================== */
+let simTimer = null;
+const SIM_DT = 0.25;   // seconds per tick (4 Hz)
+
+const sim = {
+  state: "PUMP_RUNNING",
+  cycle: 1, cycleTotal: 3,
+  hue: TARGET_HUE,
+  temp: 22.0,
+  breakDuration: 0, breakRemaining: 0,
+  runElapsed: 0,
+  completeDwell: 0,
+  pink: 85,             // % pink — drains toward colourless as the reaction proceeds
+};
+
+/* EXACT port of the firmware calculateAdaptiveBreak() (source of truth on the
+   ESP32). Same steps: colour deficit → temperature-derated recovery → 1.2x
+   safety buffer → clamp [MIN_BREAK, MAX_BREAK]. */
+function calculateAdaptiveBreak(currentHue, fluidTemperature) {
+  const colorDeficit = TARGET_HUE - currentHue;
+  if (colorDeficit <= 0) return MIN_BREAK;
+  let temperatureFactor = 1.0 - ((fluidTemperature - 20.0) * 0.02);
+  if (temperatureFactor < 0.5) temperatureFactor = 0.5;
+  const effectiveRecovery = BASE_RECOVERY_RATE * temperatureFactor;
+  const requiredTime = colorDeficit / effectiveRecovery;
+  let finalBreakTime = requiredTime * 1.2;
+  if (finalBreakTime < MIN_BREAK) finalBreakTime = MIN_BREAK;
+  if (finalBreakTime > MAX_BREAK) finalBreakTime = MAX_BREAK;
+  return finalBreakTime;
+}
+/* Effective O2 recovery rate (hue units/s) — mirrors the firmware's
+   temperature-derated air-stone recovery; drives Sim recovery + the readout. */
+function effectiveRecoveryRate(fluidTemperature) {
+  let tf = 1.0 - ((fluidTemperature - 20.0) * 0.02);
+  if (tf < 0.5) tf = 0.5;
+  return BASE_RECOVERY_RATE * tf;
+}
+
+function simTick() {
+  const powered = $("powerBtn").dataset.mode !== "off";
+  const noise = (a) => (Math.random() - 0.5) * a;
+
+  // Temperature slowly wanders; recovery uses the exact firmware temp model.
+  sim.temp = clamp(sim.temp + noise(0.06), 20, 27);
+  const recovery = effectiveRecoveryRate(sim.temp);   // hue units/s from the air stone
+  let pumpPWM = 0;
+
+  if (!powered) {
+    // E-stopped: pump dead, hue holds.
+    sim.state = "PUMP_RUNNING";
+    pumpPWM = 0;
+  } else if (sim.state === "PUMP_RUNNING") {
+    pumpPWM = clamp(ui.basePWM + noise(6), 0, 255);
+    // O2 model (grounded in ariduin0code.cpp): pump ON → the reaction consumes O2,
+    // so hue (the O2 proxy) FALLS at a rate scaled by pump output, per litre.
+    const o2Demand = (pumpPWM / 255) * O2_DRAW_PER_S / VOLUME_L * SIM_DT;
+    sim.hue = clamp(sim.hue - o2Demand + noise(0.3), 40, TARGET_HUE + 5);
+    // Pink dye is consumed as the reaction proceeds (pink → colourless).
+    sim.pink = clamp(sim.pink - (pumpPWM / 255) * 6 * SIM_DT + noise(0.2), 0, 100);
+    sim.runElapsed += SIM_DT;
+
+    // Dose for the full PUMP_RUN_TIME_S (matches firmware), unless O2 crashes to the
+    // safety floor first. This keeps PWM a clean square wave inverse to the O2 curve.
+    if (sim.hue <= O2_CRASH_HUE || sim.runElapsed >= PUMP_RUN_TIME_S) {
+      sim.state = "ADAPTIVE_BREAK";
+      sim.runElapsed = 0;
+      sim.breakDuration = (ui.algorithmMode === "manual")
+        ? clamp(ui.manualBreak, MIN_BREAK, MAX_BREAK)
+        : calculateAdaptiveBreak(sim.hue, sim.temp);   // EXACT firmware algorithm
+      sim.breakRemaining = sim.breakDuration;
+    }
+  } else if (sim.state === "ADAPTIVE_BREAK") {
+    pumpPWM = 0;                        // liquid pump rests; air stone aerates
+    sim.breakRemaining = Math.max(0, sim.breakRemaining - SIM_DT);
+    // O2 (hue) recovers at the air-stone recovery rate assumed by the algorithm.
+    sim.hue = clamp(sim.hue + recovery * SIM_DT + noise(0.2), 40, TARGET_HUE);
+    if (sim.breakRemaining <= 0) {
+      sim.cycle += 1;
+      sim.state = (sim.cycle > sim.cycleTotal) ? "BATCH_COMPLETE" : "PUMP_RUNNING";
+    }
+  } else if (sim.state === "BATCH_COMPLETE") {
+    pumpPWM = 0;
+    sim.breakRemaining = 0; sim.breakDuration = 0;
+    sim.pink = clamp(sim.pink - 1.5 * SIM_DT, 0, 100);   // settle to colourless
+    // Auto-restart the demo batch after a short dwell so Sim Mode keeps looping.
+    sim.completeDwell += SIM_DT;
+    if (sim.completeDwell > 6) {
+      Object.assign(sim, { state: "PUMP_RUNNING", cycle: 1, hue: TARGET_HUE, runElapsed: 0, completeDwell: 0, pink: 85 });
+      resetReaction();
+    }
+  }
+
+  // Saturation display = O2 level as a % of target, read from the solution colour.
+  const saturationPct = clamp((sim.hue / TARGET_HUE) * 100, 0, 100);
+
+  handleInbound({
+    type: "telemetry",
+    timestamp: Date.now(),
+    state: sim.state,
+    cycle: Math.min(sim.cycle, sim.cycleTotal),
+    cycleTotal: sim.cycleTotal,
+    hue: sim.hue,
+    targetHue: TARGET_HUE,
+    saturationPct,
+    fluidTemperature: sim.temp,
+    pumpPWM,
+    breakDurationSeconds: sim.breakDuration,
+    breakRemainingSeconds: sim.breakRemaining,
+    recoveryRateEffective: recovery,
+    algorithmMode: ui.algorithmMode,
+    systemPowered: powered,
+    pinkPercentage: sim.pink,        // drives the Reaction Status card in Sim Mode
+  });
+}
+
+function startSimulation() {
+  disconnect();                     // sim only runs with no live link
+  stopCameraFeed();                 // sim fakes the feed; stop the real camera
+  // Reset sim run + reaction state.
+  Object.assign(sim, { state: "PUMP_RUNNING", cycle: 1, hue: TARGET_HUE, runElapsed: 0, breakDuration: 0, breakRemaining: 0, completeDwell: 0, pink: 85 });
+  resetReaction();
+  if (!powerArmState) setPowerVisual("on");
+  // Placeholder feed labelled as simulation.
+  $("noSignal").style.display = "grid";
+  $("noSignalSub").textContent = "SIMULATION MODE";
+  setStatus("simulation");
+  clearInterval(simTimer);
+  simTimer = setInterval(simTick, SIM_DT * 1000);
+}
+function stopSimulation() {
+  clearInterval(simTimer); simTimer = null;
+  if (ui.connMode === "simulation") setStatus("disconnected");
+  $("simSwitch").classList.remove("on");
+}
+
+/* =====================================================================
+ *  SECTION 8 — Kill switch (deliberate two-step arm/confirm e-stop)
+ * ===================================================================== */
+let powerArmState = null;    // null | "arm"
+let armTimeout = null;
+
+function setPowerVisual(mode) {
+  const btn = $("powerBtn");
+  btn.dataset.mode = mode;
+  $("armTimer").style.display = "none";
+  powerArmState = (mode === "arm") ? "arm" : null;
+  if (mode === "on") {
+    $("powerLabel").textContent = "ONLINE";
+    $("powerHint").textContent  = "Click to arm shutdown";
+  } else if (mode === "off") {
+    $("powerLabel").textContent = "OFFLINE";
+    $("powerHint").textContent  = "Click to power on";
+  } else if (mode === "arm") {
+    $("powerLabel").textContent = "CONFIRM KILL";
+    $("powerHint").textContent  = "Click again to cut power";
+  }
+}
+
+function onPowerClick() {
+  const mode = $("powerBtn").dataset.mode;
+  if (mode === "off") {
+    // Powering ON is the safe direction — single click.
+    setPowerVisual("on");
+    sendCommand("setPower", true);
+  } else if (mode === "on") {
+    // First click ARMS the e-stop; must confirm within 3s.
+    setPowerVisual("arm");
+    const timer = $("armTimer");
+    timer.style.display = "block";
+    timer.style.transition = "none";
+    timer.style.transform  = "scaleX(1)";
+    // Force reflow so the transition restarts.
+    void timer.offsetWidth;
+    timer.style.transition = "transform 3s linear";
+    timer.style.transform  = "scaleX(0)";
+    clearTimeout(armTimeout);
+    armTimeout = setTimeout(() => { if ($("powerBtn").dataset.mode === "arm") setPowerVisual("on"); }, 3000);
+  } else if (mode === "arm") {
+    // Confirmed — cut power.
+    clearTimeout(armTimeout);
+    setPowerVisual("off");
+    sendCommand("setPower", false);
+  }
+}
+
+/* =====================================================================
+ *  SECTION 9 — Control wiring (debounced / on-release outbound commands)
+ * ===================================================================== */
+function wireControls() {
+  /* Connect / disconnect (label driven by connection intent, not raw socket state) */
+  const setConnectBtn = (active) => {
+    $("connectBtn").textContent = active ? "Disconnect" : "Connect";
+    $("connectBtn").classList.toggle("primary", !active);
+  };
+  $("connectBtn").addEventListener("click", () => {
+    if (linkActive) { disconnect(); setConnectBtn(false); return; }
+    $("simSwitch").classList.remove("on");
+    connect($("hostInput").value.trim());
+    setConnectBtn(true);
+  });
+
+  /* Simulation toggle */
+  $("simSwitch").addEventListener("click", () => {
+    const el = $("simSwitch");
+    const on = !el.classList.contains("on");
+    el.classList.toggle("on", on);
+    if (on) { setConnectBtn(false); startSimulation(); }
+    else    { stopSimulation(); startCameraFeed(); }   // resume the real camera
+  });
+
+  /* Camera URL — (re)load the feed whenever the field changes; works standalone,
+     no Connect required. Retries until the camera comes online. */
+  $("camInput").addEventListener("change", () => {
+    if ($("simSwitch").classList.contains("on")) return;   // sim owns the feed
+    startCameraFeed();
+  });
+
+  /* Pink bridge URL — reconnect if a live link is active. */
+  $("pinkInput").addEventListener("change", () => { if (pinkActive) connectPink(); });
+
+  /* Kill switch */
+  $("powerBtn").addEventListener("click", onPowerClick);
+  $("powerBtn").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPowerClick(); } });
+
+  /* Target saturation — update label live, send on release/change only */
+  const satSlider = $("satSlider");
+  satSlider.addEventListener("input",  () => { $("satSliderVal").textContent = satSlider.value; });
+  satSlider.addEventListener("change", () => { sendCommand("setTargetSaturation", Number(satSlider.value)); });
+
+  /* Base pump speed — raw + derived %, send on release/change only */
+  const pwmSlider = $("pwmSlider");
+  const updatePwmLabel = () => {
+    $("pwmSliderVal").textContent = pwmSlider.value;
+    $("pwmSliderPct").textContent = ` · ${Math.round(pwmSlider.value / 255 * 100)}%`;
+  };
+  pwmSlider.addEventListener("input",  updatePwmLabel);
+  pwmSlider.addEventListener("change", () => { sendCommand("setBasePumpPWM", Number(pwmSlider.value)); });
+
+  /* Algorithm mode segmented control */
+  $("algoSeg").querySelectorAll("button").forEach((b) => {
+    b.addEventListener("click", () => {
+      $("algoSeg").querySelectorAll("button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      const mode = b.dataset.mode;
+      $("manualBox").classList.toggle("show", mode === "manual");
+      sendCommand("setAlgorithmMode", mode);
+      if (mode === "manual") sendCommand("setManualBreakSeconds", clampManualBreak());
+    });
+  });
+
+  /* Manual break input — clamped 5–45s, send on change */
+  const manual = $("manualBreak");
+  const clampManualBreakUI = () => {
+    const v = clampManualBreak();
+    manual.value = v;
+    $("manualBreakEcho").textContent = v;
+    return v;
+  };
+  manual.addEventListener("input",  () => { $("manualBreakEcho").textContent = manual.value; });
+  manual.addEventListener("change", () => { sendCommand("setManualBreakSeconds", clampManualBreakUI()); });
+}
+function clampManualBreak() {
+  const raw = Number($("manualBreak").value);
+  return clamp(isNaN(raw) ? MIN_BREAK : raw, MIN_BREAK, MAX_BREAK);
+}
+
+/* =====================================================================
+ *  SECTION 10 — Boot
+ * ===================================================================== */
+window.addEventListener("DOMContentLoaded", () => {
+  initChart();
+  wireControls();
+  setStatus("disconnected");
+  setPowerVisual("off");
+  setPinkBridge(false);
+  renderReaction(0);
+  // Seed control labels.
+  $("pwmSliderPct").textContent = ` · ${Math.round(180 / 255 * 100)}%`;
+  // Camera is "up and ready" from boot: start trying the stream immediately so
+  // it appears the moment the ESP32-CAM is switched on.
+  startCameraFeed();
+});
+</script>
