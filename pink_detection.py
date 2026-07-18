@@ -1,4 +1,3 @@
-from fcntl import LOCK_WRITE
 import cv2
 import numpy as np
 
@@ -42,7 +41,7 @@ while True:
         alert_text = f"pink detected ({pink_percentage:.1f}%)"
         text_color = (0, 0, 255)
     else:
-        alert_text = f"searched for pink {pink_percentage:.1f}%"
+        alert_text = f"searching for pink {pink_percentage:.1f}%"
         text_color = (0, 255, 0)
 
     cv2.putText(frame, alert_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 
